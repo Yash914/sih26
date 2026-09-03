@@ -4,7 +4,7 @@ import sqlite3
 import tempfile
 from datetime import datetime
 import subprocess
-
+import xgboost as xgb
 import numpy as np
 import shap
 
@@ -39,9 +39,8 @@ app.add_middleware(
 # Load XGBoost model
 # -----------------------------
 
-model = joblib.load(
-    "model/xgboost_distress_model.pkl"
-)
+model = xgb.XGBRegressor()
+model.load_model("model/xgboost_distress_model.json")
 explainer = shap.TreeExplainer(model)
 
 FEATURES = [
