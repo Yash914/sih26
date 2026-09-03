@@ -4,8 +4,11 @@ import sqlite3
 import tempfile
 from datetime import datetime
 import subprocess
-from pydantic import BaseModel
+
 import numpy as np
+import shap
+
+from pydantic import BaseModel
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -39,7 +42,7 @@ app.add_middleware(
 model = joblib.load(
     "model/xgboost_distress_model.pkl"
 )
-
+explainer = shap.TreeExplainer(model)
 
 FEATURES = [
     "text_angry",
@@ -57,6 +60,24 @@ FEATURES = [
     "audio_sad",
     "audio_surprised"
 ]
+
+FEATURE_DISPLAY_NAMES = {
+    "text_angry": "Anger in text",
+    "text_disgust": "Disgust in text",
+    "text_fear": "Fear in text",
+    "text_happy": "Happiness in text",
+    "text_neutral": "Neutral emotion in text",
+    "text_sad": "Sadness in text",
+    "text_surprise": "Surprise in text",
+
+    "audio_anger": "Anger in voice",
+    "audio_calm": "Calmness in voice",
+    "audio_disgust": "Disgust in voice",
+    "audio_fearful": "Fear in voice",
+    "audio_happy": "Happiness in voice",
+    "audio_sad": "Sadness in voice",
+    "audio_surprised": "Surprise in voice"
+}
 
 
 # -----------------------------
@@ -85,6 +106,59 @@ def init_db():
 
 init_db()
 
+def get_shap_explanation(features):
+    """
+    Generate SHAP explanation for one multimodal XGBoost prediction.
+
+    Returns:
+    - all 14 feature contributions
+    - top 5 contributing factors
+    """
+
+    shap_values = explainer.shap_values(features)
+
+    # One prediction -> one row of SHAP values
+    values = shap_values[0]
+
+    explanation = []
+
+    for i, feature_name in enumerate(FEATURES):
+
+        impact = float(values[i])
+        feature_value = float(features[0][i])
+
+        explanation.append({
+            "feature": feature_name,
+            "display_name": FEATURE_DISPLAY_NAMES.get(
+                feature_name,
+                feature_name
+            ),
+            "value": round(feature_value, 4),
+            "impact": round(impact, 4),
+            "direction": (
+                "increases_risk"
+                if impact > 0
+                else "decreases_risk"
+            )
+        })
+
+    # Strongest factors first
+    explanation.sort(
+        key=lambda x: abs(x["impact"]),
+        reverse=True
+    )
+
+    # Only the most influential factors for the UI
+    top_factors = explanation[:5]
+
+    return {
+        "base_value": round(
+            float(explainer.expected_value),
+            4
+        ),
+        "top_contributing_factors": top_factors,
+        "all_features": explanation
+    }
 
 # -----------------------------
 # Request schema
@@ -130,6 +204,312 @@ def get_risk_level(score):
 
     else:
         return "Severe"
+
+
+# -----------------------------
+# Health check
+# -----------------------------
+
+@app.post("/analyze-interaction")
+async def analyze_interaction(
+    case_id: str = Form(...),
+    text: str = Form(""),
+    audio: UploadFile | None = File(None)
+):
+    """
+    Analyze an interaction using:
+    - text only
+    - audio only
+    - both text + audio
+
+    Both modalities -> trained XGBoost fusion model.
+    Single modality -> transparent modality-specific heuristic.
+    """
+
+    text = (text or "").strip()
+
+    # ---------------------------------------------------------
+    # 1. Check that at least one modality is provided
+    # ---------------------------------------------------------
+
+    has_text = bool(text)
+    has_audio = audio is not None
+
+    if not has_text and not has_audio:
+        raise HTTPException(
+            status_code=400,
+            detail="Please provide text, audio, or both."
+        )
+
+    # ---------------------------------------------------------
+    # 2. TEXT ANALYSIS
+    # ---------------------------------------------------------
+
+    text_result = None
+    text_probs = None
+
+    if has_text:
+        try:
+            text_result = analyze_text(text)
+            text_probs = text_result["probabilities"]
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Text analysis failed: {str(e)}"
+            )
+
+    # ---------------------------------------------------------
+    # 3. AUDIO ANALYSIS
+    # ---------------------------------------------------------
+
+    audio_result = None
+    audio_probs = None
+
+    input_audio_path = None
+    converted_wav_path = None
+
+    if has_audio:
+
+        try:
+            # Save uploaded audio
+            suffix = os.path.splitext(audio.filename or ".audio")[1]
+
+            with tempfile.NamedTemporaryFile(
+                delete=False,
+                suffix=suffix
+            ) as temp_audio:
+
+                input_audio_path = temp_audio.name
+
+                audio_bytes = await audio.read()
+                temp_audio.write(audio_bytes)
+
+            # -------------------------------------------------
+            # Convert ANY uploaded audio -> 16 kHz mono WAV
+            # -------------------------------------------------
+
+            converted_wav_path = input_audio_path + "_converted.wav"
+
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    input_audio_path,
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "16000",
+                    "-c:a",
+                    "pcm_s16le",
+                    converted_wav_path
+                ],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+
+            # -------------------------------------------------
+            # Run F2 audio model
+            # -------------------------------------------------
+
+            audio_result = recognizer.predict(converted_wav_path)
+            audio_probs = audio_result["probabilities"]
+
+        except subprocess.CalledProcessError as e:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Could not convert uploaded audio."
+            )
+
+        except Exception as e:
+
+            raise HTTPException(
+                status_code=500,
+                detail=f"Audio analysis failed: {str(e)}"
+            )
+
+        finally:
+
+            # Clean temporary files
+            for path in [input_audio_path, converted_wav_path]:
+
+                if path and os.path.exists(path):
+
+                    try:
+                        os.remove(path)
+                    except Exception:
+                        pass
+
+    # ---------------------------------------------------------
+    # 4. DETERMINE WHICH MODALITIES WERE USED
+    # ---------------------------------------------------------
+
+    if has_text and has_audio:
+        modality = "multimodal"
+        modalities_used = ["text", "audio"]
+
+    elif has_text:
+        modality = "text_only"
+        modalities_used = ["text"]
+
+    else:
+        modality = "audio_only"
+        modalities_used = ["audio"]
+
+    # ---------------------------------------------------------
+    # 5. CALCULATE DISTRESS SCORE
+    # ---------------------------------------------------------
+    shap_explanation = None
+
+    if modality == "multimodal":
+
+    # =============================================
+    # TRAINED 14-FEATURE XGBOOST
+    # =============================================
+
+        features = np.array([[
+            text_probs.get("angry", 0.0),
+            text_probs.get("disgust", 0.0),
+            text_probs.get("fear", 0.0),
+            text_probs.get("happy", 0.0),
+            text_probs.get("neutral", 0.0),
+            text_probs.get("sad", 0.0),
+            text_probs.get("surprise", 0.0),
+
+            audio_probs.get("anger", 0.0),
+            audio_probs.get("calm", 0.0),
+            audio_probs.get("disgust", 0.0),
+            audio_probs.get("fearful", 0.0),
+            audio_probs.get("happy", 0.0),
+            audio_probs.get("sad", 0.0),
+            audio_probs.get("surprised", 0.0)
+        ]])
+
+        # XGBoost prediction
+        distress_score = float(
+            model.predict(features)[0]
+        )
+
+        distress_score = float(
+            np.clip(distress_score, 0, 24)
+        )
+
+        scoring_method = "xgboost_multimodal"
+
+        # SHAP explanation
+        try:
+            shap_explanation = get_shap_explanation(features)
+
+        except Exception as e:
+            shap_explanation = {
+                "base_value": None,
+                "top_contributing_factors": [],
+                "all_features": [],
+                "error": str(e)
+            }
+
+    elif modality == "text_only":
+
+        # =============================================
+        # TEXT-ONLY DEMO HEURISTIC
+        # =============================================
+
+        distress_score = (
+            0.35 * text_probs.get("sad", 0.0)
+            + 0.30 * text_probs.get("fear", 0.0)
+            + 0.20 * text_probs.get("angry", 0.0)
+            + 0.15 * text_probs.get("disgust", 0.0)
+        )
+
+        distress_score = float(
+            np.clip(distress_score * 24, 0, 24)
+        )
+
+        scoring_method = "text_only_heuristic"
+
+    else:
+
+        # =============================================
+        # AUDIO-ONLY DEMO HEURISTIC
+        # =============================================
+
+        distress_score = (
+            0.35 * audio_probs.get("sad", 0.0)
+            + 0.30 * audio_probs.get("fearful", 0.0)
+            + 0.20 * audio_probs.get("anger", 0.0)
+            + 0.15 * audio_probs.get("disgust", 0.0)
+        )
+
+        distress_score = float(
+            np.clip(distress_score * 24, 0, 24)
+        )
+
+        scoring_method = "audio_only_heuristic"
+
+    # ---------------------------------------------------------
+    # 6. RISK LEVEL
+    # ---------------------------------------------------------
+
+    if distress_score < 5:
+        risk_level = "Low"
+
+    elif distress_score < 10:
+        risk_level = "Moderate"
+
+    elif distress_score < 15:
+        risk_level = "High"
+
+    else:
+        risk_level = "Severe"
+
+    # ---------------------------------------------------------
+    # 7. SAVE INTERACTION
+    # ---------------------------------------------------------
+
+    timestamp = datetime.now().isoformat()
+
+    conn = sqlite3.connect(DB_PATH)
+
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        INSERT INTO interactions
+        (case_id, timestamp, distress_score, risk_level)
+        VALUES (?, ?, ?, ?)
+        """,
+        (
+            case_id,
+            timestamp,
+            distress_score,
+            risk_level
+        )
+    )
+
+    conn.commit()
+    conn.close()
+
+    # ---------------------------------------------------------
+    # 8. RESPONSE
+    # ---------------------------------------------------------
+
+    return {
+    "case_id": case_id,
+    "timestamp": timestamp,
+    "modalities_used": modalities_used,
+    "modality": modality,
+
+    "text_analysis": text_result,
+    "audio_analysis": audio_result,
+
+    "distress_score": round(distress_score, 2),
+    "risk_level": risk_level,
+    "scoring_method": scoring_method,
+
+    "shap_explanation": shap_explanation
+}
 
 
 # -----------------------------
@@ -339,294 +719,6 @@ def get_summary(case_id: str):
         "alert": priority
     }
 
-# -----------------------------
-# Health check
-# -----------------------------
-
-@app.post("/analyze-interaction")
-async def analyze_interaction(
-    case_id: str = Form(...),
-    text: str = Form(""),
-    audio: UploadFile | None = File(None)
-):
-    """
-    Analyze an interaction using:
-    - text only
-    - audio only
-    - both text + audio
-
-    Both modalities -> trained XGBoost fusion model.
-    Single modality -> transparent modality-specific heuristic.
-    """
-
-    text = (text or "").strip()
-
-    # ---------------------------------------------------------
-    # 1. Check that at least one modality is provided
-    # ---------------------------------------------------------
-
-    has_text = bool(text)
-    has_audio = audio is not None
-
-    if not has_text and not has_audio:
-        raise HTTPException(
-            status_code=400,
-            detail="Please provide text, audio, or both."
-        )
-
-    # ---------------------------------------------------------
-    # 2. TEXT ANALYSIS
-    # ---------------------------------------------------------
-
-    text_result = None
-    text_probs = None
-
-    if has_text:
-        try:
-            text_result = analyze_text(text)
-            text_probs = text_result["probabilities"]
-        except Exception as e:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Text analysis failed: {str(e)}"
-            )
-
-    # ---------------------------------------------------------
-    # 3. AUDIO ANALYSIS
-    # ---------------------------------------------------------
-
-    audio_result = None
-    audio_probs = None
-
-    input_audio_path = None
-    converted_wav_path = None
-
-    if has_audio:
-
-        try:
-            # Save uploaded audio
-            suffix = os.path.splitext(audio.filename or ".audio")[1]
-
-            with tempfile.NamedTemporaryFile(
-                delete=False,
-                suffix=suffix
-            ) as temp_audio:
-
-                input_audio_path = temp_audio.name
-
-                audio_bytes = await audio.read()
-                temp_audio.write(audio_bytes)
-
-            # -------------------------------------------------
-            # Convert ANY uploaded audio -> 16 kHz mono WAV
-            # -------------------------------------------------
-
-            converted_wav_path = input_audio_path + "_converted.wav"
-
-            subprocess.run(
-                [
-                    "ffmpeg",
-                    "-y",
-                    "-i",
-                    input_audio_path,
-                    "-ac",
-                    "1",
-                    "-ar",
-                    "16000",
-                    "-c:a",
-                    "pcm_s16le",
-                    converted_wav_path
-                ],
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
-            )
-
-            # -------------------------------------------------
-            # Run F2 audio model
-            # -------------------------------------------------
-
-            audio_result = recognizer.predict(converted_wav_path)
-            audio_probs = audio_result["probabilities"]
-
-        except subprocess.CalledProcessError as e:
-
-            raise HTTPException(
-                status_code=400,
-                detail="Could not convert uploaded audio."
-            )
-
-        except Exception as e:
-
-            raise HTTPException(
-                status_code=500,
-                detail=f"Audio analysis failed: {str(e)}"
-            )
-
-        finally:
-
-            # Clean temporary files
-            for path in [input_audio_path, converted_wav_path]:
-
-                if path and os.path.exists(path):
-
-                    try:
-                        os.remove(path)
-                    except Exception:
-                        pass
-
-    # ---------------------------------------------------------
-    # 4. DETERMINE WHICH MODALITIES WERE USED
-    # ---------------------------------------------------------
-
-    if has_text and has_audio:
-        modality = "multimodal"
-        modalities_used = ["text", "audio"]
-
-    elif has_text:
-        modality = "text_only"
-        modalities_used = ["text"]
-
-    else:
-        modality = "audio_only"
-        modalities_used = ["audio"]
-
-    # ---------------------------------------------------------
-    # 5. CALCULATE DISTRESS SCORE
-    # ---------------------------------------------------------
-
-    if modality == "multimodal":
-
-        # =============================================
-        # TRAINED 14-FEATURE XGBOOST
-        # =============================================
-
-        features = np.array([[
-            text_probs.get("angry", 0.0),
-            text_probs.get("disgust", 0.0),
-            text_probs.get("fear", 0.0),
-            text_probs.get("happy", 0.0),
-            text_probs.get("neutral", 0.0),
-            text_probs.get("sad", 0.0),
-            text_probs.get("surprise", 0.0),
-
-            audio_probs.get("anger", 0.0),
-            audio_probs.get("calm", 0.0),
-            audio_probs.get("disgust", 0.0),
-            audio_probs.get("fearful", 0.0),
-            audio_probs.get("happy", 0.0),
-            audio_probs.get("sad", 0.0),
-            audio_probs.get("surprised", 0.0)
-        ]])
-
-        distress_score = float(model.predict(features)[0])
-
-        distress_score = float(
-            np.clip(distress_score, 0, 24)
-        )
-
-        scoring_method = "xgboost_multimodal"
-
-    elif modality == "text_only":
-
-        # =============================================
-        # TEXT-ONLY DEMO HEURISTIC
-        # =============================================
-
-        distress_score = (
-            0.35 * text_probs.get("sad", 0.0)
-            + 0.30 * text_probs.get("fear", 0.0)
-            + 0.20 * text_probs.get("angry", 0.0)
-            + 0.15 * text_probs.get("disgust", 0.0)
-        )
-
-        distress_score = float(
-            np.clip(distress_score * 24, 0, 24)
-        )
-
-        scoring_method = "text_only_heuristic"
-
-    else:
-
-        # =============================================
-        # AUDIO-ONLY DEMO HEURISTIC
-        # =============================================
-
-        distress_score = (
-            0.35 * audio_probs.get("sad", 0.0)
-            + 0.30 * audio_probs.get("fearful", 0.0)
-            + 0.20 * audio_probs.get("anger", 0.0)
-            + 0.15 * audio_probs.get("disgust", 0.0)
-        )
-
-        distress_score = float(
-            np.clip(distress_score * 24, 0, 24)
-        )
-
-        scoring_method = "audio_only_heuristic"
-
-    # ---------------------------------------------------------
-    # 6. RISK LEVEL
-    # ---------------------------------------------------------
-
-    if distress_score < 5:
-        risk_level = "Low"
-
-    elif distress_score < 10:
-        risk_level = "Moderate"
-
-    elif distress_score < 15:
-        risk_level = "High"
-
-    else:
-        risk_level = "Severe"
-
-    # ---------------------------------------------------------
-    # 7. SAVE INTERACTION
-    # ---------------------------------------------------------
-
-    timestamp = datetime.now().isoformat()
-
-    conn = sqlite3.connect(DB_PATH)
-
-    cursor = conn.cursor()
-
-    cursor.execute(
-        """
-        INSERT INTO interactions
-        (case_id, timestamp, distress_score, risk_level)
-        VALUES (?, ?, ?, ?)
-        """,
-        (
-            case_id,
-            timestamp,
-            distress_score,
-            risk_level
-        )
-    )
-
-    conn.commit()
-    conn.close()
-
-    # ---------------------------------------------------------
-    # 8. RESPONSE
-    # ---------------------------------------------------------
-
-    return {
-        "case_id": case_id,
-        "timestamp": timestamp,
-
-        "modalities_used": modalities_used,
-        "modality": modality,
-
-        "text_analysis": text_result,
-        "audio_analysis": audio_result,
-
-        "distress_score": round(distress_score, 2),
-        "risk_level": risk_level,
-
-        "scoring_method": scoring_method
-    }
 
 @app.get("/")
 def root():
