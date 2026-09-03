@@ -13,6 +13,7 @@ from pydantic import BaseModel
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+import imageio_ffmpeg
 
 from services.text_analyzer import analyze_text
 from services.audio_analyzer import recognizer
@@ -63,8 +64,11 @@ async def analyze_interaction(case_id:str=Form(...),text:str=Form(""),audio:Uplo
     if has_audio:
         try:
             ext=os.path.splitext(audio.filename or ".audio")[1] or ".audio"; saved_name=f"{uuid.uuid4().hex}{ext}"; saved_path=UPLOAD_DIR/saved_name; saved_path.write_bytes(await audio.read()); audio_url=f"/media/{saved_name}"; wav_path=str(UPLOAD_DIR/f"{uuid.uuid4().hex}.wav")
-            subprocess.run(["ffmpeg","-y","-i",str(saved_path),"-ac","1","-ar","16000","-c:a","pcm_s16le",wav_path],check=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE); audio_result=recognizer.predict(wav_path); audio_probs=audio_result["probabilities"]
-        except subprocess.CalledProcessError: raise HTTPException(400,"Could not convert uploaded audio. Make sure ffmpeg is installed and the file is valid.")
+            ffmpeg_exe=imageio_ffmpeg.get_ffmpeg_exe()
+            subprocess.run([ffmpeg_exe,"-y","-i",str(saved_path),"-ac","1","-ar","16000","-c:a","pcm_s16le",wav_path],check=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+            audio_result=recognizer.predict(wav_path); audio_probs=audio_result["probabilities"]
+        except subprocess.CalledProcessError as e:
+            raise HTTPException(400,"Could not convert uploaded audio. The audio file may be invalid or unsupported.")
         except Exception as e: raise HTTPException(500,f"Audio analysis failed: {e}")
         finally:
             if wav_path and os.path.exists(wav_path): os.remove(wav_path)
