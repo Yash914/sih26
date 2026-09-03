@@ -1,0 +1,17 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# Local database
+distress.db
+
+# Archives / temporary files
+archive.zip
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store

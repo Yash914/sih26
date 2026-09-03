@@ -1,0 +1,60 @@
+Low:
+
+{
+  "case_id": "CASE_DEMO_LONGITUDINAL",
+  "text_angry": 0.02,
+  "text_disgust": 0.01,
+  "text_fear": 0.03,
+  "text_happy": 0.45,
+  "text_neutral": 0.40,
+  "text_sad": 0.05,
+  "text_surprise": 0.04,
+  "audio_anger": 0.01,
+  "audio_calm": 0.55,
+  "audio_disgust": 0.01,
+  "audio_fearful": 0.02,
+  "audio_happy": 0.30,
+  "audio_sad": 0.05,
+  "audio_surprised": 0.06
+}
+
+high:
+
+{
+  "case_id": "CASE_DEMO_LONGITUDINAL",
+  "text_angry": 0.04,
+  "text_disgust": 0.02,
+  "text_fear": 0.10,
+  "text_happy": 0.15,
+  "text_neutral": 0.30,
+  "text_sad": 0.32,
+  "text_surprise": 0.07,
+  "audio_anger": 0.04,
+  "audio_calm": 0.25,
+  "audio_disgust": 0.02,
+  "audio_fearful": 0.12,
+  "audio_happy": 0.15,
+  "audio_sad": 0.32,
+  "audio_surprised": 0.10
+}
+
+
+more high: 
+
+{
+  "case_id": "CASE_DEMO_LONGITUDINAL",
+  "text_angry": 0.08,
+  "text_disgust": 0.02,
+  "text_fear": 0.20,
+  "text_happy": 0.03,
+  "text_neutral": 0.15,
+  "text_sad": 0.48,
+  "text_surprise": 0.04,
+  "audio_anger": 0.08,
+  "audio_calm": 0.05,
+  "audio_disgust": 0.02,
+  "audio_fearful": 0.25,
+  "audio_happy": 0.03,
+  "audio_sad": 0.52,
+  "audio_surprised": 0.05
+}
